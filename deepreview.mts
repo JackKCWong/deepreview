@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { Readable, Writable } from "node:stream";
+import fs from "node:fs";
 import path from "node:path";
 import {
   client,
@@ -19,6 +20,7 @@ export type DeepReviewOptions = {
   args?: string[];
   cwd?: string;
   maxNudges?: number;
+  minPct?: number;
 };
 
 export type DeepReviewResult = {
@@ -28,28 +30,64 @@ export type DeepReviewResult = {
   nudges: number;
 };
 
-type ToolCallState = { kind?: string; paths: string[] };
+type ReadChunk = { path: string; offset?: number; limit?: number };
+type ToolCallState = { kind?: string; chunks: ReadChunk[] };
 
 function normalizePath(p: string, cwd: string): string {
   if (p.startsWith("file://")) p = new URL(p).pathname;
   return path.resolve(cwd, p);
 }
 
-function extractReadPaths(
+function extractReadChunks(
   update: Extract<SessionUpdate, { sessionUpdate: "tool_call" | "tool_call_update" }>,
-): string[] {
-  const out: string[] = [];
-  for (const loc of (update as { locations?: { path: string }[] }).locations ?? []) {
-    if (loc.path) out.push(loc.path);
-  }
+): ReadChunk[] {
+  const out: ReadChunk[] = [];
   const raw = (update as { rawInput?: unknown }).rawInput;
   if (raw && typeof raw === "object") {
     const r = raw as Record<string, unknown>;
     for (const key of ["filePath", "file_path", "path", "absolutePath"]) {
-      if (typeof r[key] === "string") out.push(r[key] as string);
+      if (typeof r[key] === "string") {
+        out.push({
+          path: r[key] as string,
+          offset: typeof r.offset === "number" ? r.offset : undefined,
+          limit: typeof r.limit === "number" ? r.limit : undefined,
+        });
+      }
     }
   }
+  if (out.length > 0) return out;
+  for (const loc of (update as { locations?: { path: string }[] }).locations ?? []) {
+    if (loc.path) out.push({ path: loc.path });
+  }
   return out;
+}
+
+function countLines(file: string): number {
+  try {
+    const content = fs.readFileSync(file, "utf8");
+    if (content.length === 0) return 0;
+    return content.split("\n").length - (content.endsWith("\n") ? 1 : 0);
+  } catch {
+    return 1;
+  }
+}
+
+type LineIntervals = { start: number; end: number }[];
+
+function addInterval(intervals: LineIntervals, start: number, end: number): void {
+  intervals.push({ start, end });
+  intervals.sort((a, b) => a.start - b.start);
+  for (let i = 0; i < intervals.length - 1; i++) {
+    if (intervals[i].end >= intervals[i + 1].start) {
+      intervals[i].end = Math.max(intervals[i].end, intervals[i + 1].end);
+      intervals.splice(i + 1, 1);
+      i--;
+    }
+  }
+}
+
+function coveredLines(intervals: LineIntervals): number {
+  return intervals.reduce((sum, i) => sum + (i.end - i.start), 0);
 }
 
 export type DeepReviewPrompt = {
@@ -68,6 +106,7 @@ export async function deepReview(
   const command = options.command ?? "opencode";
   const args = options.args ?? (command === "opencode" ? ["acp"] : []);
   const maxNudges = options.maxNudges ?? paths.length + 1;
+  const minPct = Math.min(100, Math.max(1, options.minPct ?? 60));
 
   const proc = spawn(command, args, { stdio: ["pipe", "pipe", "inherit"] });
   await new Promise<void>((resolve, reject) => {
@@ -81,7 +120,27 @@ export async function deepReview(
   );
 
   const toolCalls = new Map<string, ToolCallState>();
-  const readSet = new Set<string>();
+  const readIntervals = new Map<string, LineIntervals>();
+
+  const recordRead = (chunk: ReadChunk) => {
+    const target = normalizePath(chunk.path, cwd);
+    const total = countLines(target);
+    const intervals = readIntervals.get(target) ?? [];
+    if (chunk.limit == null) {
+      addInterval(intervals, 0, total);
+    } else {
+      const start = chunk.offset != null && chunk.offset > 0 ? chunk.offset - 1 : 0;
+      addInterval(intervals, start, Math.min(start + chunk.limit, total));
+    }
+    readIntervals.set(target, intervals);
+  };
+
+  const isReviewed = (target: string): boolean => {
+    const total = countLines(target);
+    if (total === 0) return readIntervals.has(target);
+    const covered = coveredLines(readIntervals.get(target) ?? []);
+    return covered * 100 >= total * minPct;
+  };
 
   const app = client({ name: "deepreview" }).onNotification(
     "session/update",
@@ -92,12 +151,13 @@ export async function deepReview(
         update.sessionUpdate === "tool_call" ||
         update.sessionUpdate === "tool_call_update"
       ) {
-        const state = toolCalls.get(update.toolCallId) ?? { paths: [] };
+        const state = toolCalls.get(update.toolCallId) ?? { chunks: [] };
         if (update.kind) state.kind = update.kind;
-        state.paths.push(...extractReadPaths(update));
+        state.chunks.push(...extractReadChunks(update));
         toolCalls.set(update.toolCallId, state);
         if (state.kind === "read") {
-          for (const p of state.paths) readSet.add(normalizePath(p, cwd));
+          for (const c of state.chunks) recordRead(c);
+          state.chunks = [];
         }
       }
     },
@@ -139,7 +199,7 @@ export async function deepReview(
       let stopReason: StopReason = "end_turn";
 
       while (true) {
-        const remaining = targets.filter((t) => !readSet.has(t));
+        const remaining = targets.filter((t) => !isReviewed(t));
         const text =
           nudges === 0
             ? render(prompt.user, fileList)
@@ -151,14 +211,14 @@ export async function deepReview(
         });
         stopReason = res.stopReason;
 
-        const unread = targets.filter((t) => !readSet.has(t));
+        const unread = targets.filter((t) => !isReviewed(t));
         if (unread.length === 0 || nudges >= maxNudges) break;
         nudges += 1;
       }
 
       return {
-        readPaths: targets.filter((t) => readSet.has(t)),
-        unreadPaths: targets.filter((t) => !readSet.has(t)),
+        readPaths: targets.filter((t) => isReviewed(t)),
+        unreadPaths: targets.filter((t) => !isReviewed(t)),
         stopReason,
         nudges,
       };
