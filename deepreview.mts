@@ -6,6 +6,7 @@ import {
   client,
   ndJsonStream,
   PROTOCOL_VERSION,
+  type ContentBlock,
   type SessionUpdate,
   type StopReason,
 } from "@agentclientprotocol/sdk";
@@ -92,6 +93,28 @@ function coveredLines(intervals: LineIntervals): number {
   return intervals.reduce((sum, i) => sum + (i.end - i.start), 0);
 }
 
+function extractMentionPaths(text: string, cwd: string): string[] {
+  const seen = new Set<string>();
+  for (const match of text.matchAll(/@([^\s@]+)/g)) {
+    const mention = match[1].replace(/[.,;:!?)\]]+$/, "");
+    if (!mention) continue;
+    const p = normalizePath(mention, cwd);
+    try {
+      if (fs.statSync(p).isFile()) seen.add(p);
+    } catch {
+      continue;
+    }
+  }
+  return [...seen];
+}
+
+function mentionToResource(p: string): ContentBlock {
+  return {
+    type: "resource",
+    resource: { uri: `file://${p}`, text: fs.readFileSync(p, "utf8") },
+  };
+}
+
 export type DeepReviewPrompt = {
   user: string;
   nudge: string;
@@ -110,7 +133,7 @@ export async function deepReview(
   const command = options.command ?? "opencode";
   const args = options.args ?? (command === "opencode" ? ["acp"] : []);
   const maxNudges = options.maxNudges ?? paths.length + 1;
-  const minPct = Math.min(100, Math.max(1, options.minPct ?? 100));
+  const minPct = Math.min(100, Math.max(1, options.minPct ?? 60));
 
   const proc = spawn(command, args, {
     cwd: opencodeCwd,
@@ -202,6 +225,14 @@ export async function deepReview(
       const render = (text: string, files: string) =>
         text.replaceAll("{{file_list}}", files);
 
+      const mentions = extractMentionPaths(prompt.user, sessionCwd);
+      const mentionBlocks = mentions.map(mentionToResource);
+      for (const p of mentions) {
+        const intervals = readIntervals.get(p) ?? [];
+        addInterval(intervals, 0, countLines(p));
+        readIntervals.set(p, intervals);
+      }
+
       let nudges = 0;
       let stopReason: StopReason = "end_turn";
 
@@ -212,9 +243,12 @@ export async function deepReview(
             ? render(prompt.user, fileList)
             : render(prompt.nudge, remaining.join("\n"));
 
+        const blocks: ContentBlock[] = [{ type: "text", text }];
+        if (nudges === 0) blocks.push(...mentionBlocks);
+
         const res = await agent.request("session/prompt", {
           sessionId,
-          prompt: [{ type: "text", text }],
+          prompt: blocks,
         });
         stopReason = res.stopReason;
 
