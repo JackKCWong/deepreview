@@ -19,6 +19,8 @@ export type DeepReviewOptions = {
   command?: string;
   args?: string[];
   cwd?: string;
+  opencodeCwd?: string;
+  sessionCwd?: string;
   maxNudges?: number;
   minPct?: number;
 };
@@ -103,12 +105,17 @@ export async function deepReview(
   options: DeepReviewOptions = {},
 ): Promise<DeepReviewResult> {
   const cwd = options.cwd ?? process.cwd();
+  const opencodeCwd = options.opencodeCwd ?? cwd;
+  const sessionCwd = options.sessionCwd ?? cwd;
   const command = options.command ?? "opencode";
   const args = options.args ?? (command === "opencode" ? ["acp"] : []);
   const maxNudges = options.maxNudges ?? paths.length + 1;
-  const minPct = Math.min(100, Math.max(1, options.minPct ?? 60));
+  const minPct = Math.min(100, Math.max(1, options.minPct ?? 100));
 
-  const proc = spawn(command, args, { stdio: ["pipe", "pipe", "inherit"] });
+  const proc = spawn(command, args, {
+    cwd: opencodeCwd,
+    stdio: ["pipe", "pipe", "inherit"],
+  });
   await new Promise<void>((resolve, reject) => {
     proc.once("spawn", resolve);
     proc.once("error", reject);
@@ -123,7 +130,7 @@ export async function deepReview(
   const readIntervals = new Map<string, LineIntervals>();
 
   const recordRead = (chunk: ReadChunk) => {
-    const target = normalizePath(chunk.path, cwd);
+    const target = normalizePath(chunk.path, sessionCwd);
     const total = countLines(target);
     const intervals = readIntervals.get(target) ?? [];
     if (chunk.limit == null) {
@@ -163,7 +170,7 @@ export async function deepReview(
     },
   );
 
-  const targets = paths.map((p) => normalizePath(p, cwd));
+  const targets = paths.map((p) => normalizePath(p, sessionCwd));
 
   try {
     return await app.connectWith(stream, async (agent) => {
@@ -174,7 +181,7 @@ export async function deepReview(
       });
 
       const { sessionId } = await agent.request("session/new", {
-        cwd,
+        cwd: sessionCwd,
         mcpServers: [],
       });
 
