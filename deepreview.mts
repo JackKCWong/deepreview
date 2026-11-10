@@ -52,9 +52,14 @@ function extractReadPaths(
   return out;
 }
 
+export type DeepReviewPrompt = {
+  user: string;
+  nudge: string;
+};
+
 export async function deepReview(
   sessionOptions: SessionOptions,
-  prompt: string,
+  prompt: DeepReviewPrompt,
   paths: string[],
   onMessage: (update: SessionUpdate) => void,
   options: DeepReviewOptions = {},
@@ -127,7 +132,8 @@ export async function deepReview(
       }
 
       const fileList = targets.join("\n");
-      const render = (text: string) => text.replaceAll("{{file_list}}", fileList);
+      const render = (text: string, files: string) =>
+        text.replaceAll("{{file_list}}", files);
 
       let nudges = 0;
       let stopReason: StopReason = "end_turn";
@@ -136,8 +142,8 @@ export async function deepReview(
         const remaining = targets.filter((t) => !readSet.has(t));
         const text =
           nudges === 0
-            ? render(prompt)
-            : `You have not read the following files yet. Read each of them now with the read tool before continuing your review:\n${remaining.join("\n")}`;
+            ? render(prompt.user, fileList)
+            : render(prompt.nudge, remaining.join("\n"));
 
         const res = await agent.request("session/prompt", {
           sessionId,
